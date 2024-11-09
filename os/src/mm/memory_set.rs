@@ -96,7 +96,7 @@
 ///
 /// - `remap_test()`
 ///   Performs a remap test in kernel space.
-//! Implementation of [`MapArea`] and [`MemorySet`].
+/// Implementation of [`MapArea`] and [`MemorySet`].
 
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
