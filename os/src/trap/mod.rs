@@ -80,6 +80,7 @@ pub fn trap_handler() -> ! {
             exit_current_and_run_next();
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            trace!("==yield==");
             set_next_trigger();
             suspend_current_and_run_next();
         }

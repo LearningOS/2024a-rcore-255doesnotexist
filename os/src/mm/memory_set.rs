@@ -1,3 +1,101 @@
+/// The `MemorySet` struct represents an address space, which includes a page table and a collection of memory areas.
+/// It provides methods to create new memory sets, manipulate memory areas, and manage the page table.
+///
+/// # Methods
+///
+/// - `new_bare() -> Self`
+///   Creates a new empty `MemorySet`.
+///
+/// - `token(&self) -> usize`
+///   Returns the page table token.
+///
+/// - `insert_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission)`
+///   Inserts a framed area into the memory set.
+///
+/// - `push(&mut self, map_area: MapArea, data: Option<&[u8]>)`
+///   Adds a `MapArea` to the memory set and optionally copies data into it.
+///
+/// - `map_trampoline(&mut self)`
+///   Maps the trampoline code into the memory set.
+///
+/// - `new_kernel() -> Self`
+///   Creates a new kernel memory set, mapping kernel sections and physical memory.
+///
+/// - `from_elf(elf_data: &[u8]) -> (Self, usize, usize)`
+///   Creates a new memory set from an ELF file, mapping its sections and setting up the user stack and trap context.
+///
+/// - `activate(&self)`
+///   Activates the memory set by writing to the `satp` CSR register and performing a TLB flush.
+///
+/// - `translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry>`
+///   Translates a virtual page number to a page table entry.
+///
+/// - `shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool`
+///   Shrinks a memory area to a new end address.
+///
+/// - `append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool`
+///   Extends a memory area to a new end address.
+///
+/// - `map(&mut self, start: VirtAddr, end: VirtAddr, permission: MapPermission) -> Result<(), ()>`
+///   Maps a new area in the memory set, returning an error if there are conflicts.
+///
+/// - `unmap(&mut self, start: VirtAddr, end: VirtAddr) -> Result<(), ()>`
+///   Unmaps an area in the memory set, returning an error if there are conflicts.
+///
+/// - `map_one(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, map_perm: MapPermission)`
+///   Maps a single virtual page to a physical page.
+///
+/// - `unmap_one(&mut self, vpn: VirtPageNum)`
+///   Unmaps a single virtual page.
+///
+/// The `MapArea` struct represents a contiguous piece of virtual memory and provides methods to manage it.
+///
+/// # Methods
+///
+/// - `new(start_va: VirtAddr, end_va: VirtAddr, map_type: MapType, map_perm: MapPermission) -> Self`
+///   Creates a new `MapArea`.
+///
+/// - `map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum)`
+///   Maps a single virtual page in the `MapArea`.
+///
+/// - `unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum)`
+///   Unmaps a single virtual page in the `MapArea`.
+///
+/// - `map(&mut self, page_table: &mut PageTable)`
+///   Maps all virtual pages in the `MapArea`.
+///
+/// - `unmap(&mut self, page_table: &mut PageTable)`
+///   Unmaps all virtual pages in the `MapArea`.
+///
+/// - `shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum)`
+///   Shrinks the `MapArea` to a new end page number.
+///
+/// - `shrink_from_begin(&mut self, page_table: &mut PageTable, new_start: VirtPageNum)`
+///   Shrinks the `MapArea` from the beginning to a new start page number.
+///
+/// - `shrink_to_slice(&mut self, page_table: &mut PageTable, new_start: VirtPageNum, new_end: VirtPageNum)`
+///   Shrinks the `MapArea` to a slice defined by new start and end page numbers.
+///
+/// - `append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum)`
+///   Extends the `MapArea` to a new end page number.
+///
+/// - `copy_data(&mut self, page_table: &mut PageTable, data: &[u8])`
+///   Copies data into the `MapArea`.
+///
+/// - `split_at(&mut self, index: VirtPageNum) -> MapArea`
+///   Splits the `MapArea` at a given page number, returning the new `MapArea` containing the split-off part.
+///
+/// The `MapType` enum represents the type of mapping for a memory set, either identical or framed.
+///
+/// The `MapPermission` struct represents the permissions for a memory set, corresponding to the `R`, `W`, `X`, and `U` flags in a page table entry.
+///
+/// # Functions
+///
+/// - `kernel_stack_position(app_id: usize) -> (usize, usize)`
+///   Returns the bottom and top addresses of a kernel stack in kernel space.
+///
+/// - `remap_test()`
+///   Performs a remap test in kernel space.
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
 use super::{frame_alloc, FrameTracker};
@@ -11,6 +109,7 @@ use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::vec;
 use core::arch::asm;
 use lazy_static::*;
 use riscv::register::satp;
@@ -262,6 +361,106 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map a area, return error when conflicts
+    pub fn map(&mut self, start: VirtAddr, end: VirtAddr, permission: MapPermission) -> Result<(), ()> {
+        for area in &self.areas {
+            if !(end <= area.vpn_range.get_start().into()
+            || start >= area.vpn_range.get_end().into()) {
+                return Err(());
+            }
+        }
+
+        self.insert_framed_area(start, end, permission);
+
+        Ok(())
+    }
+
+    /// Unmap a area, return error when conflicts
+    pub fn unmap(&mut self, start: VirtAddr, end: VirtAddr) -> Result<(),()> {
+        let mut parts: Vec<(VirtPageNum,VirtPageNum)> = vec![(start.floor(), end.ceil())];
+        let mut remove_index: Vec<usize> = Vec::new();
+        let mut shrink_from_begin: Vec<(usize, VirtPageNum)> = Vec::new();
+        let mut shrink_from_end: Vec<(usize, VirtPageNum)> = Vec::new();
+        let mut shrink: Vec<(usize, VirtPageNum, VirtPageNum)> = Vec::new();
+
+        for (i, area) in self.areas.iter().enumerate() {
+            // area.data_frames.
+            for (j, part) in parts.clone().iter().enumerate() {
+                // if contains a range that was 
+                if part.0 == area.vpn_range.get_start() && part.1 == area.vpn_range.get_end() {
+                    remove_index.push(i);
+                    parts.remove(j);
+                    break;
+                }
+
+                if part.0 > area.vpn_range.get_start() && part.1 >= area.vpn_range.get_end() && part.0 < area.vpn_range.get_end() {
+                    shrink_from_end.push((i, part.0));
+                    parts.remove(j);
+                    if part.1 > area.vpn_range.get_end() {
+                        parts.push((area.vpn_range.get_end(),part.1));
+                    }
+                    break;
+                }
+
+                if part.0 <= area.vpn_range.get_start() && part.1 < area.vpn_range.get_end() && part.1 > area.vpn_range.get_start() {
+                    shrink_from_begin.push((i, part.1));
+                    parts.remove(j);
+                    if part.0 < area.vpn_range.get_start() {
+                        parts.push((part.0,area.vpn_range.get_start()));
+                    }
+                    break;
+                }
+
+                if part.0 > area.vpn_range.get_start() && part.0 < area.vpn_range.get_end() 
+                && part.1 > area.vpn_range.get_start() && part.1 < area.vpn_range.get_end() {
+                    shrink.push((i, part.0, part.1));
+                    parts.remove(j);
+                    break;
+                }
+            }
+        }
+
+        if !parts.is_empty() {
+            return Err(())
+        }
+
+        // shrink all map areas that required to shrink
+        for it in shrink_from_begin {
+            self.areas[it.0].shrink_from_begin(&mut self.page_table, it.1);
+        }
+
+        for it in shrink_from_end {
+            self.areas[it.0].shrink_to(&mut self.page_table, it.1);
+        }
+
+        for it in shrink {
+            self.areas[it.0].shrink_to_slice(&mut self.page_table, it.1, it.2);
+        }
+
+        // remove all map areas that required to remove
+        let mut i: usize = 0;
+        for index in remove_index.clone() {
+            self.areas[index].unmap(&mut self.page_table);
+        }
+        self.areas.retain(|_| {
+            i += 1;
+            !remove_index.contains(&(i - 1))
+        });
+
+        Ok(())
+    }
+
+    /// map one virtual page, may cause leaking in pte.
+    pub fn map_one(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, map_perm: MapPermission) {
+        let flags = PTEFlags::from_bits(map_perm.bits).unwrap();
+        self.page_table.map(vpn, ppn, flags);
+    }
+
+    /// map one virtual page, may cause leaking in pte.
+    pub fn unmap_one(&mut self, vpn: VirtPageNum) {
+        self.page_table.unmap(vpn);
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -328,6 +527,23 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
+    pub fn shrink_from_begin(&mut self, page_table: &mut PageTable, new_start: VirtPageNum) {
+        for vpn in VPNRange::new(self.vpn_range.get_start(), new_start) {
+            self.unmap_one(page_table, vpn)
+        }
+        self.vpn_range = VPNRange::new(new_start, self.vpn_range.get_end());
+    }
+    #[allow(unused)]
+    pub fn shrink_to_slice(&mut self, page_table: &mut PageTable, new_start: VirtPageNum, new_end: VirtPageNum) {
+        for vpn in VPNRange::new(self.vpn_range.get_start(), new_start) {
+            self.unmap_one(page_table, vpn)
+        }
+        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
+            self.unmap_one(page_table, vpn)
+        }
+        self.vpn_range = VPNRange::new(new_start, new_end);
+    }
+    #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
@@ -355,6 +571,25 @@ impl MapArea {
             }
             current_vpn.step();
         }
+    }
+
+    /// Split the map area into two pieces.
+    /// current map area will be the shrinked,
+    /// returned map area will contain shrinked part.
+    #[allow(unused)]
+    pub fn split_at(&mut self, index: VirtPageNum) -> MapArea{
+        assert!(index < self.vpn_range.get_end(), "Given vpn range was longer than end.");
+        assert!(index > self.vpn_range.get_start(), "Given vpn range was shorter than start.");
+
+        let ret = MapArea{
+            vpn_range: VPNRange::new(index, self.vpn_range.get_end()),
+            data_frames: self.data_frames.split_off(&index),
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        };
+        
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), index);
+        ret
     }
 }
 
